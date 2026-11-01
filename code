@@ -1,0 +1,551 @@
+"""
+Attendance Management System
+Python 3 + SQLite (standard library only)
+
+Run:  python attendance_system.py
+"""
+
+import csv
+import sqlite3
+from datetime import date, datetime
+
+DB_FILE = "attendance.db"
+MIN_PERCENT = 75.0  # minimum attendance required
+
+
+# ---------------------------------------------------------------- database
+def get_conn(path=DB_FILE):
+    conn = sqlite3.connect(path)
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
+
+
+def init_db(conn):
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS students (
+            student_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            roll_no    TEXT NOT NULL UNIQUE,
+            name       TEXT NOT NULL,
+            email      TEXT
+        );
+        CREATE TABLE IF NOT EXISTS courses (
+            course_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            code      TEXT NOT NULL UNIQUE,
+            title     TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS enrollments (
+            student_id INTEGER NOT NULL REFERENCES students(student_id) ON DELETE CASCADE,
+            course_id  INTEGER NOT NULL REFERENCES courses(course_id)  ON DELETE CASCADE,
+            PRIMARY KEY (student_id, course_id)
+        );
+        CREATE TABLE IF NOT EXISTS attendance (
+            attendance_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            student_id    INTEGER NOT NULL REFERENCES students(student_id) ON DELETE CASCADE,
+            course_id     INTEGER NOT NULL REFERENCES courses(course_id)  ON DELETE CASCADE,
+            att_date      TEXT NOT NULL,
+            status        TEXT NOT NULL CHECK (status IN ('P','A','L')),
+            UNIQUE (student_id, course_id, att_date)
+        );
+        CREATE INDEX IF NOT EXISTS idx_att_course_date ON attendance(course_id, att_date);
+        """
+    )
+    conn.commit()
+
+
+# ---------------------------------------------------------------- core logic
+def add_student(conn, roll_no, name, email=""):
+    conn.execute(
+        "INSERT INTO students (roll_no, name, email) VALUES (?, ?, ?)",
+        (roll_no.strip(), name.strip(), email.strip()),
+    )
+    conn.commit()
+
+
+def add_course(conn, code, title):
+    conn.execute(
+        "INSERT INTO courses (code, title) VALUES (?, ?)",
+        (code.strip().upper(), title.strip()),
+    )
+    conn.commit()
+
+
+def enroll(conn, roll_no, code):
+    sid = _student_id(conn, roll_no)
+    cid = _course_id(conn, code)
+    conn.execute(
+        "INSERT OR IGNORE INTO enrollments (student_id, course_id) VALUES (?, ?)",
+        (sid, cid),
+    )
+    conn.commit()
+
+
+def mark_attendance(conn, code, att_date, marks):
+    """marks: dict {roll_no: 'P'|'A'|'L'}. Re-marking a date updates the record."""
+    cid = _course_id(conn, code)
+    for roll_no, status in marks.items():
+        sid = _student_id(conn, roll_no)
+        conn.execute(
+            """INSERT INTO attendance (student_id, course_id, att_date, status)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT(student_id, course_id, att_date)
+               DO UPDATE SET status = excluded.status""",
+            (sid, cid, att_date, status.upper()),
+        )
+    conn.commit()
+
+
+def update_student(conn, roll_no, new_roll=None, new_name=None, new_email=None):
+    """Blank/None fields are left unchanged."""
+    sid = _student_id(conn, roll_no)
+    row = conn.execute("SELECT roll_no, name, email FROM students WHERE student_id = ?", (sid,)).fetchone()
+    roll, name, email = new_roll or row[0], new_name or row[1], new_email if new_email else row[2]
+    conn.execute(
+        "UPDATE students SET roll_no = ?, name = ?, email = ? WHERE student_id = ?",
+        (roll.strip(), name.strip(), (email or "").strip(), sid),
+    )
+    conn.commit()
+
+
+def delete_student(conn, roll_no):
+    sid = _student_id(conn, roll_no)  # attendance + enrollments are removed by CASCADE
+    conn.execute("DELETE FROM students WHERE student_id = ?", (sid,))
+    conn.commit()
+
+
+def edit_attendance(conn, roll_no, code, att_date, status):
+    """Change an existing attendance record."""
+    sid, cid = _student_id(conn, roll_no), _course_id(conn, code)
+    cur = conn.execute(
+        "UPDATE attendance SET status = ? WHERE student_id = ? AND course_id = ? AND att_date = ?",
+        (status.upper(), sid, cid, att_date),
+    )
+    conn.commit()
+    if cur.rowcount == 0:
+        raise ValueError("No attendance record found for that student/course/date")
+
+
+def delete_attendance(conn, roll_no, code, att_date):
+    sid, cid = _student_id(conn, roll_no), _course_id(conn, code)
+    cur = conn.execute(
+        "DELETE FROM attendance WHERE student_id = ? AND course_id = ? AND att_date = ?",
+        (sid, cid, att_date),
+    )
+    conn.commit()
+    if cur.rowcount == 0:
+        raise ValueError("No attendance record found for that student/course/date")
+
+
+def list_courses(conn):
+    """Course list with number of enrolled students and classes held so far."""
+    return conn.execute(
+        """SELECT c.code, c.title,
+                  (SELECT COUNT(*) FROM enrollments e WHERE e.course_id = c.course_id),
+                  (SELECT COUNT(DISTINCT att_date) FROM attendance a WHERE a.course_id = c.course_id)
+           FROM courses c ORDER BY c.code"""
+    ).fetchall()
+
+
+def enrolled_students(conn, code):
+    return conn.execute(
+        """SELECT s.roll_no, s.name FROM students s
+           JOIN enrollments e ON e.student_id = s.student_id
+           JOIN courses c ON c.course_id = e.course_id
+           WHERE c.code = ? ORDER BY s.roll_no""",
+        (code.upper(),),
+    ).fetchall()
+
+
+def attendance_summary(conn, code=None):
+    """Per student/course: total classes, attended (P + L counts as present), percent."""
+    query = """
+        SELECT s.roll_no, s.name, c.code,
+               COUNT(a.attendance_id)                              AS total,
+               SUM(CASE WHEN a.status IN ('P','L') THEN 1 ELSE 0 END) AS attended
+        FROM attendance a
+        JOIN students s ON s.student_id = a.student_id
+        JOIN courses  c ON c.course_id  = a.course_id
+    """
+    params = ()
+    if code:
+        query += " WHERE c.code = ?"
+        params = (code.upper(),)
+    query += " GROUP BY s.student_id, c.course_id ORDER BY c.code, s.roll_no"
+    rows = []
+    for roll, name, ccode, total, attended in conn.execute(query, params):
+        pct = round(100.0 * attended / total, 2) if total else 0.0
+        rows.append((roll, name, ccode, total, attended, pct))
+    return rows
+
+
+def defaulters(conn, code=None, threshold=MIN_PERCENT):
+    return [r for r in attendance_summary(conn, code) if r[5] < threshold]
+
+
+def daily_report(conn, code, att_date):
+    return conn.execute(
+        """SELECT s.roll_no, s.name, a.status FROM attendance a
+           JOIN students s ON s.student_id = a.student_id
+           JOIN courses  c ON c.course_id  = a.course_id
+           WHERE c.code = ? AND a.att_date = ? ORDER BY s.roll_no""",
+        (code.upper(), att_date),
+    ).fetchall()
+
+
+def attendance_matrix(conn, code):
+    """Date-wise table for one course.
+    Returns (headers, rows): Roll No | Name | <date1> | <date2> ... | Total | Attended | %"""
+    cid = _course_id(conn, code)
+    dates = [r[0] for r in conn.execute(
+        "SELECT DISTINCT att_date FROM attendance WHERE course_id = ? ORDER BY att_date", (cid,))]
+    records = {}
+    for roll, d, st in conn.execute(
+        """SELECT s.roll_no, a.att_date, a.status FROM attendance a
+           JOIN students s ON s.student_id = a.student_id WHERE a.course_id = ?""", (cid,)):
+        records[(roll, d)] = st
+    headers = ["Roll No", "Name"] + dates + ["Total", "Attended", "Percent"]
+    rows = []
+    for roll, name in enrolled_students(conn, code):
+        marks = [records.get((roll, d), "-") for d in dates]
+        total = sum(1 for m in marks if m != "-")
+        attended = sum(1 for m in marks if m in ("P", "L"))
+        pct = round(100.0 * attended / total, 2) if total else 0.0
+        rows.append([roll, name] + marks + [total, attended, pct])
+    return headers, rows
+
+
+def export_register_csv(conn, filename, code=None):
+    """Writes a date-wise attendance table (one block per course) that opens
+    as a proper table in Excel / Google Sheets. Returns number of student rows."""
+    codes = [code.upper()] if code else [r[0] for r in conn.execute("SELECT code FROM courses ORDER BY code")]
+    count = 0
+    with open(filename, "w", newline="", encoding="utf-8-sig") as f:  # utf-8-sig: Excel reads it correctly
+        w = csv.writer(f)
+        for i, c in enumerate(codes):
+            title = conn.execute("SELECT title FROM courses WHERE code = ?", (c,)).fetchone()
+            if i:
+                w.writerow([])
+            w.writerow([f"Course: {c} - {title[0] if title else ''}"])
+            headers, rows = attendance_matrix(conn, c)
+            w.writerow(headers)
+            w.writerows(rows)
+            count += len(rows)
+        w.writerow([])
+        w.writerow(["P = Present", "A = Absent", "L = Leave", "- = Not marked"])
+    return count
+
+
+def export_summary_csv(conn, filename, code=None):
+    """Separate summary file: one row per student per course with counts,
+    percentage and Eligible / Defaulter status. Returns number of rows."""
+    query = """
+        SELECT s.roll_no, s.name, c.code, c.title,
+               COUNT(a.attendance_id),
+               SUM(a.status = 'P'), SUM(a.status = 'A'), SUM(a.status = 'L')
+        FROM attendance a
+        JOIN students s ON s.student_id = a.student_id
+        JOIN courses  c ON c.course_id  = a.course_id
+    """
+    params = ()
+    if code:
+        query += " WHERE c.code = ?"
+        params = (code.upper(),)
+    query += " GROUP BY s.student_id, c.course_id ORDER BY c.code, s.roll_no"
+    rows = []
+    for roll, name, ccode, title, total, p_, a_, l_ in conn.execute(query, params):
+        attended = p_ + l_
+        pct = round(100.0 * attended / total, 2) if total else 0.0
+        status = "Eligible" if pct >= MIN_PERCENT else "Defaulter"
+        rows.append([roll, name, ccode, title, total, p_, a_, l_, attended, pct, status])
+    with open(filename, "w", newline="", encoding="utf-8-sig") as f:
+        w = csv.writer(f)
+        w.writerow(["Roll No", "Name", "Course Code", "Course Title", "Total Classes",
+                    "Present", "Absent", "Leave", "Attended (P+L)", "Percent", "Status"])
+        w.writerows(rows)
+        w.writerow([])
+        w.writerow([f"Minimum required attendance: {MIN_PERCENT}%"])
+    return len(rows)
+
+
+def export_students_csv(conn, filename):
+    """Student records file: roll no, name, email and the courses each student is enrolled in."""
+    rows = conn.execute(
+        """SELECT s.roll_no, s.name, s.email, COALESCE(GROUP_CONCAT(c.code, ', '), '')
+           FROM students s
+           LEFT JOIN enrollments e ON e.student_id = s.student_id
+           LEFT JOIN courses c ON c.course_id = e.course_id
+           GROUP BY s.student_id ORDER BY s.roll_no"""
+    ).fetchall()
+    with open(filename, "w", newline="", encoding="utf-8-sig") as f:
+        w = csv.writer(f)
+        w.writerow(["Roll No", "Name", "Email", "Enrolled Courses"])
+        w.writerows(rows)
+    return len(rows)
+
+
+def export_excel(conn, filename, code=None):
+    """Formatted Excel workbook with real tables (needs: pip install openpyxl).
+    Sheets: Student Records, Attendance Summary, one Register sheet per course."""
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+        from openpyxl.utils import get_column_letter
+    except ImportError:
+        raise ValueError("openpyxl install karo:  pip install openpyxl")
+
+    head_fill = PatternFill("solid", fgColor="1F4E78")
+    red = PatternFill("solid", fgColor="F8CBAD")
+    green = PatternFill("solid", fgColor="C6E0B4")
+    thin = Side(style="thin", color="999999")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    def write_table(ws, headers, rows, start_row=1):
+        for c, h in enumerate(headers, 1):
+            cell = ws.cell(row=start_row, column=c, value=h)
+            cell.font = Font(bold=True, color="FFFFFF")
+            cell.fill = head_fill
+            cell.alignment = Alignment(horizontal="center")
+            cell.border = border
+        for r, row in enumerate(rows, start_row + 1):
+            for c, v in enumerate(row, 1):
+                cell = ws.cell(row=r, column=c, value=v)
+                cell.border = border
+                if c > 2:
+                    cell.alignment = Alignment(horizontal="center")
+        for c in range(1, len(headers) + 1):
+            width = max(len(str(ws.cell(row=r, column=c).value or ""))
+                        for r in range(start_row, start_row + len(rows) + 1))
+            ws.column_dimensions[get_column_letter(c)].width = max(width + 3, 10)
+        ws.freeze_panes = ws.cell(row=start_row + 1, column=3)
+
+    wb = Workbook()
+
+    # Sheet 1: student records
+    ws = wb.active
+    ws.title = "Student Records"
+    recs = conn.execute(
+        """SELECT s.roll_no, s.name, COALESCE(s.email,''), COALESCE(GROUP_CONCAT(c.code, ', '), '')
+           FROM students s
+           LEFT JOIN enrollments e ON e.student_id = s.student_id
+           LEFT JOIN courses c ON c.course_id = e.course_id
+           GROUP BY s.student_id ORDER BY s.roll_no""").fetchall()
+    write_table(ws, ["Roll No", "Name", "Email", "Enrolled Courses"], recs)
+
+    # Course list sheet
+    ws = wb.create_sheet("Course List")
+    write_table(ws, ["Code", "Title", "Students", "Classes Held"], [list(r) for r in list_courses(conn)])
+
+    # Sheet 2: summary (defaulters highlighted)
+    ws = wb.create_sheet("Attendance Summary")
+    rows = [list(r) for r in attendance_summary(conn, code)]
+    write_table(ws, ["Roll No", "Name", "Course", "Total", "Attended", "Percent"], rows)
+    for r in range(2, len(rows) + 2):
+        ws.cell(row=r, column=6).fill = red if ws.cell(row=r, column=6).value < MIN_PERCENT else green
+
+    # Sheets 3+: date-wise register per course
+    codes = [code.upper()] if code else [r[0] for r in conn.execute("SELECT code FROM courses ORDER BY code")]
+    for c in codes:
+        ws = wb.create_sheet(f"Register {c}"[:31])
+        headers, rows = attendance_matrix(conn, c)
+        write_table(ws, headers, rows)
+        for r in range(2, len(rows) + 2):
+            for col in range(3, len(headers) - 2):
+                cell = ws.cell(row=r, column=col)
+                if cell.value == "A":
+                    cell.fill = red
+                elif cell.value in ("P", "L"):
+                    cell.fill = green
+            pc = ws.cell(row=r, column=len(headers))
+            pc.fill = red if pc.value < MIN_PERCENT else green
+
+    wb.save(filename)
+    return len(wb.sheetnames)
+
+
+def export_courses_csv(conn, filename):
+    """Course list file: code, title, enrolled students and classes held."""
+    rows = list_courses(conn)
+    with open(filename, "w", newline="", encoding="utf-8-sig") as f:
+        w = csv.writer(f)
+        w.writerow(["Course Code", "Course Title", "Enrolled Students", "Classes Held"])
+        w.writerows(rows)
+    return len(rows)
+
+
+def delete_all_data(conn):
+    """Removes every student, course, enrollment and attendance record."""
+    for t in ("attendance", "enrollments", "students", "courses"):
+        conn.execute(f"DELETE FROM {t}")
+    conn.execute("DELETE FROM sqlite_sequence")  # IDs dobara 1 se shuru
+    conn.commit()
+
+
+def _student_id(conn, roll_no):
+    row = conn.execute("SELECT student_id FROM students WHERE roll_no = ?", (roll_no.strip(),)).fetchone()
+    if not row:
+        raise ValueError(f"Student '{roll_no}' not found")
+    return row[0]
+
+
+def _course_id(conn, code):
+    row = conn.execute("SELECT course_id FROM courses WHERE code = ?", (code.strip().upper(),)).fetchone()
+    if not row:
+        raise ValueError(f"Course '{code}' not found")
+    return row[0]
+
+
+# ---------------------------------------------------------------- CLI helpers
+def print_table(headers, rows):
+    if not rows:
+        print("  (no records)")
+        return
+    widths = [max(len(str(x)) for x in col) for col in zip(headers, *rows)]
+    line = " | ".join(h.ljust(w) for h, w in zip(headers, widths))
+    print("  " + line)
+    print("  " + "-+-".join("-" * w for w in widths))
+    for r in rows:
+        print("  " + " | ".join(str(x).ljust(w) for x, w in zip(r, widths)))
+
+
+def ask_date(prompt="Date (YYYY-MM-DD, blank = today): "):
+    s = input(prompt).strip()
+    if not s:
+        return date.today().isoformat()
+    try:
+        datetime.strptime(s, "%Y-%m-%d")
+    except ValueError:
+        raise ValueError("Date format YYYY-MM-DD hona chahiye (jaise 2026-11-01)")
+    return s
+
+
+def menu():
+    print(
+        """
+===== ATTENDANCE MANAGEMENT SYSTEM =====
+ 1. Add student         8. Mark attendance        12. Daily report
+ 2. Add course          9. Edit attendance        13. Defaulters (< 75%)
+ 3. Enroll student     10. Delete attendance      14. Date-wise table
+ 4. Students list      11. Attendance summary     15. Export 4 CSV files
+ 5. Course list                                   16. Export Excel table
+ 6. Edit student                                  17. Delete ALL data
+ 7. Delete student
+
+ 0. Exit"""
+    )
+
+
+def main():
+    conn = get_conn()
+    init_db(conn)
+    while True:
+        menu()
+        try:
+            choice = input("Choose: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nBye!")
+            break
+        try:
+            if choice == "1":
+                add_student(conn, input("Roll no: "), input("Name: "), input("Email: "))
+                print("Student added.")
+            elif choice == "2":
+                add_course(conn, input("Course code: "), input("Title: "))
+                print("Course added.")
+            elif choice == "3":
+                enroll(conn, input("Roll no: ").strip(), input("Course code: "))
+                print("Enrolled.")
+            elif choice == "4":
+                rows = conn.execute("SELECT roll_no, name, email FROM students ORDER BY roll_no").fetchall()
+                print_table(["Roll No", "Name", "Email"], rows)
+            elif choice == "8":
+                code = input("Course code: ")
+                d = ask_date()
+                students = enrolled_students(conn, code)
+                if not students:
+                    print("No students enrolled in this course.")
+                    continue
+                marks = {}
+                for roll, name in students:
+                    while True:
+                        st = input(f"  {roll} {name} [P/A/L, Enter = P]: ").strip().upper() or "P"
+                        if st in ("P", "A", "L"):
+                            break
+                        print("  Sirf P, A ya L daalo.")
+                    marks[roll] = st
+                mark_attendance(conn, code, d, marks)
+                print("Attendance saved.")
+            elif choice == "12":
+                rows = daily_report(conn, input("Course code: "), ask_date())
+                print_table(["Roll No", "Name", "Status"], rows)
+            elif choice == "11":
+                code = input("Course code (blank = all): ").strip() or None
+                print_table(["Roll No", "Name", "Course", "Total", "Attended", "%"], attendance_summary(conn, code))
+            elif choice == "13":
+                code = input("Course code (blank = all): ").strip() or None
+                print_table(["Roll No", "Name", "Course", "Total", "Attended", "%"], defaulters(conn, code))
+            elif choice == "15":
+                code = input("Course code (blank = all): ").strip() or None
+                n1 = export_register_csv(conn, "attendance_register.csv", code)
+                n2 = export_summary_csv(conn, "attendance_summary.csv", code)
+                n3 = export_students_csv(conn, "student_records.csv")
+                n4 = export_courses_csv(conn, "course_list.csv")
+                print(f"attendance_register.csv ({n1} rows), attendance_summary.csv ({n2} rows), "
+                      f"student_records.csv ({n3} rows) aur course_list.csv ({n4} rows) ban gayi.")
+            elif choice == "6":
+                roll = input("Roll no of student to edit: ").strip()
+                print("Naya value daalo (blank = purana hi rakho)")
+                update_student(conn, roll, input("New roll no: ").strip() or None,
+                               input("New name: ").strip() or None, input("New email: ").strip() or None)
+                print("Student updated.")
+            elif choice == "7":
+                roll = input("Roll no of student to delete: ").strip()
+                if input(f"{roll} aur uski saari attendance delete hogi. Sure? (y/n): ").lower() == "y":
+                    delete_student(conn, roll)
+                    print("Student deleted.")
+            elif choice == "9":
+                roll = input("Roll no: ").strip()
+                code = input("Course code: ")
+                d = ask_date("Date jo edit karni hai (YYYY-MM-DD): ")
+                st = input("New status [P/A/L]: ").strip().upper()
+                if st not in ("P", "A", "L"):
+                    raise ValueError("Status sirf P, A ya L ho sakta hai")
+                edit_attendance(conn, roll, code, d, st)
+                print("Attendance updated.")
+            elif choice == "10":
+                roll = input("Roll no: ").strip()
+                code = input("Course code: ")
+                d = ask_date("Date (YYYY-MM-DD): ")
+                delete_attendance(conn, roll, code, d)
+                print("Attendance record deleted.")
+            elif choice == "14":
+                h, r = attendance_matrix(conn, input("Course code: "))
+                print_table(h, r)
+            elif choice == "16":
+                code = input("Course code (blank = all): ").strip() or None
+                n = export_excel(conn, "attendance_report.xlsx", code)
+                print(f"attendance_report.xlsx ban gayi ({n} sheets).")
+            elif choice == "5":
+                print_table(["Code", "Title", "Students", "Classes Held"], list_courses(conn))
+            elif choice == "17":
+                if input("Poora data delete hoga (wapas nahi aayega). Confirm karne ke liye DELETE likho: ") == "DELETE":
+                    delete_all_data(conn)
+                    print("All data deleted.")
+                else:
+                    print("Cancelled.")
+            elif choice == "0":
+                break
+            else:
+                print("Invalid choice.")
+        except sqlite3.IntegrityError as e:
+            print(f"Error: duplicate or invalid data ({e})")
+        except ValueError as e:
+            print(f"Error: {e}")
+        except PermissionError:
+            print("Error: file band karo (Excel me khuli hai) aur phir dobara try karo.")
+        except OSError as e:
+            print(f"Error: file nahi ban payi ({e})")
+    conn.close()
+
+
+if __name__ == "__main__":
+    main()
